@@ -36,8 +36,15 @@ import time
 PLAN = {
     "taskmgr":   (0, 50, "FIFO"),
     "abs":       (1, 63, "FIFO"),
+<<<<<<< HEAD
     "decoder":   (2, 15, "RR"),
     "nav":       (2, 12, "RR"),
+=======
+    "airbag":    (1, 62, "FIFO"),
+    "decoder":   (2, 15, "RR"),
+    "nav":       (2, 12, "RR"),
+    "ui":        (2, 10, "RR"),
+>>>>>>> 49a13ce (updates)
     "panel":     (3, 10, "RR"),
     "dashboard": (3, 10, "RR"),
 }
