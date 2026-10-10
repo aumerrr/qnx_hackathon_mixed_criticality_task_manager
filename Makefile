@@ -1,10 +1,6 @@
 # qnx_hackathon - QNX 8.0, Raspberry Pi 4 (aarch64)
 #
-<<<<<<< HEAD
-#   car/      abs.c decoder.c (nav.c later)
-=======
 #   car/      abs.c airbag.c decoder.c nav.c ui.c
->>>>>>> 49a13ce (updates)
 #   common/   actors.c actors.h taskmgr.c tm_proto.h
 #   tools/    panel.c dashboard.py
 #
@@ -23,12 +19,7 @@ PI      = qnxuser@10.0.0.1
 
 BIN     = build
 OBJ     = build/obj
-<<<<<<< HEAD
-BINS    = $(BIN)/taskmgr $(BIN)/abs $(BIN)/decoder $(BIN)/panel $(BIN)/nav
-# nav: when car/nav.c exists, add $(BIN)/nav to BINS and uncomment its two rules below
-=======
 BINS    = $(BIN)/taskmgr $(BIN)/abs $(BIN)/airbag $(BIN)/decoder $(BIN)/nav $(BIN)/ui $(BIN)/panel
->>>>>>> 49a13ce (updates)
 
 # headers every actor depends on (a change rebuilds them all)
 ACT_H   = common/actors.h common/tm_proto.h
@@ -48,14 +39,6 @@ $(BIN)/decoder: $(OBJ)/decoder.o $(OBJ)/actors.o
 $(BIN)/nav: $(OBJ)/nav.o $(OBJ)/actors.o
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/nav.o $(OBJ)/actors.o
 
-<<<<<<< HEAD
-$(BIN)/panel: $(OBJ)/panel.o $(OBJ)/actors.o
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/panel.o $(OBJ)/actors.o
-
-#$(BIN)/nav: $(OBJ)/nav.o $(OBJ)/actors.o
-#	$(CC) $(LDFLAGS) -o $@ $(OBJ)/nav.o $(OBJ)/actors.o
-
-=======
 $(BIN)/airbag: $(OBJ)/airbag.o $(OBJ)/actors.o
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/airbag.o $(OBJ)/actors.o
 
@@ -65,7 +48,6 @@ $(BIN)/ui: $(OBJ)/ui.o $(OBJ)/actors.o
 $(BIN)/panel: $(OBJ)/panel.o $(OBJ)/actors.o
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/panel.o $(OBJ)/actors.o
 
->>>>>>> 49a13ce (updates)
 # ---- compile: sources -> objects ----
 $(OBJ)/taskmgr.o: common/taskmgr.c common/tm_proto.h | $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ common/taskmgr.c
@@ -82,14 +64,6 @@ $(OBJ)/decoder.o: car/decoder.c $(ACT_H) | $(OBJ)
 $(OBJ)/nav.o: car/nav.c $(ACT_H) | $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ car/nav.c
 
-<<<<<<< HEAD
-$(OBJ)/panel.o: tools/panel.c $(ACT_H) | $(OBJ)
-	$(CC) $(CFLAGS) -c -o $@ tools/panel.c
-
-#$(OBJ)/nav.o: car/nav.c $(ACT_H) | $(OBJ)
-#	$(CC) $(CFLAGS) -c -o $@ car/nav.c
-
-=======
 $(OBJ)/airbag.o: car/airbag.c $(ACT_H) | $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ car/airbag.c
 
@@ -99,7 +73,6 @@ $(OBJ)/ui.o: car/ui.c $(ACT_H) | $(OBJ)
 $(OBJ)/panel.o: tools/panel.c $(ACT_H) | $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ tools/panel.c
 
->>>>>>> 49a13ce (updates)
 # object folder, created once (also safe with make -j)
 $(OBJ):
 	mkdir -p $(OBJ)
@@ -108,10 +81,6 @@ deploy: all
 	scp -o MACs=hmac-sha2-256 $(BINS) tools/dashboard.py $(PI):/tmp/
 
 clean:
-<<<<<<< HEAD
-	rm -f $(BIN)/taskmgr $(BIN)/abs $(BIN)/decoder $(BIN)/panel $(BIN)/nav $(OBJ)/*.o
-=======
 	rm -f $(BINS) $(OBJ)/*.o
->>>>>>> 49a13ce (updates)
 
 .PHONY: all deploy clean
