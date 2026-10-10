@@ -1,7 +1,5 @@
-// actors.c - helpers shared by all actors
-//
-// Read top to bottom: the functions are numbered in the order you'd
-// write them and in the order a sim uses them.
+// actors.c - implementation of the shared actor library (see actors.h).
+// Sections are numbered in the order an actor uses them.
 
 #include <errno.h>          // errno, EINTR
 #include <pthread.h>        // pthread_self, pthread_setschedparam
@@ -17,37 +15,33 @@
 
 #include "actors.h"
 
-// Every pulse carries a small "code" number so the receiver knows what it is.
-// Codes below _PULSE_CODE_MINAVAIL are reserved for QNX, so ours starts there.
+// Pulse code of the timer tick (codes below _PULSE_CODE_MINAVAIL belong to QNX).
 #define TICK_CODE _PULSE_CODE_MINAVAIL
 
-// Longest we ever wait for the task manager to answer
+// Upper bound on any blocking call to the task manager.
 #define TM_CALL_LIMIT_NS (200 * NS_PER_MS)
 
 
 // ---------------------------------------------------------------------------
-// 1. Put this thread on some cores, at some priority
-//
-//    runmask : which cores I may run on (see actors.h)
-//    policy  : SCHED_FIFO = keep the CPU until I sleep (safety jobs)
-//              SCHED_RR   = take turns with equal priorities (comfort jobs)
-//    prio    : higher number = runs first and interrupts lower ones
+// 1. Core pinning and scheduling
+//    runmask : allowed cores (RMASK_* in actors.h)
+//    policy  : SCHED_FIFO for safety actors, SCHED_RR for comfort actors
+//    prio    : higher preempts lower
 // ---------------------------------------------------------------------------
 int actor_setup(unsigned runmask, int policy, int prio)
 {
-    // Pin. This only affects the thread that calls it. That's fine,
-    // because every actor has exactly one thread.
+    // Runmask of the calling thread only (every actor is single-threaded).
     if (ThreadCtl(_NTO_TCTL_RUNMASK, (void *)(uintptr_t)runmask) == -1) {
         perror("ThreadCtl");
         return -1;
     }
 
-    // Priority. Clear the whole struct first, then fill in the one field.
+    // QNX sched_param has extra fields: zero it, then set the priority.
     struct sched_param sp;
     memset(&sp, 0, sizeof sp);
     sp.sched_priority = prio;
 
-    // pthread_* functions RETURN the error number (0 = OK), not -1 + errno.
+    // pthread_* return the error number directly (not -1 + errno).
     int rc = pthread_setschedparam(pthread_self(), policy, &sp);
     if (rc != 0) {
         printf("pthread_setschedparam: %s\n", strerror(rc));   // EPERM = not root
@@ -58,7 +52,7 @@ int actor_setup(unsigned runmask, int policy, int prio)
 
 
 // ---------------------------------------------------------------------------
-// 2. Current time as one number of nanoseconds (CLOCK_MONOTONIC never jumps)
+// 2. Monotonic time in ns (unaffected by wall-clock changes)
 // ---------------------------------------------------------------------------
 int64_t actor_now_ns(void)
 {
@@ -69,43 +63,40 @@ int64_t actor_now_ns(void)
 
 
 // ---------------------------------------------------------------------------
-// 3. Start a timer that sends me a pulse every period_ns
-//    The chain:  mailbox  ->  line into it  ->  "what to send"  ->  timer
+// 3. Periodic timer: channel -> self-connection -> pulse event -> timer
 // ---------------------------------------------------------------------------
 int actor_timer_start(actor_timer_t *t, int64_t period_ns, int prio)
 {
     t->tick = 0;
     t->period_ns = period_ns;
 
-    // a) My private mailbox.
-    //    _NTO_CHF_FIXED_PRIORITY: normally a thread that receives a pulse
-    //    takes on the pulse's priority. Without this flag the timer pulse
-    //    would lift a demoted actor straight back up every tick and undo
-    //    the task manager's SchedSet.
+    // a) Private channel. _NTO_CHF_FIXED_PRIORITY: receiving a pulse must not
+    //    change our priority. Without it, every timer pulse would raise a
+    //    demoted actor back to the pulse priority and undo the TM's SchedSet.
     t->chid = ChannelCreate(_NTO_CHF_FIXED_PRIORITY);
     if (t->chid == -1) {
         perror("ChannelCreate");
         return -1;
     }
 
-    // b) A line into my own mailbox.
+    // b) Connection to our own channel (the timer delivers pulses on it).
     t->coid = ConnectAttach(0, 0, t->chid, _NTO_SIDE_CHANNEL, 0);
     if (t->coid == -1) {
         perror("ConnectAttach");
         return -1;
     }
 
-    // c) What the timer sends: a pulse on my line, my code, my priority.
+    // c) Event = pulse on that connection, at our priority, with TICK_CODE.
     struct sigevent ev;
     SIGEV_PULSE_INIT(&ev, t->coid, prio, TICK_CODE, 0);
 
-    // d) Create the timer on the monotonic clock.
+    // d) Kernel timer on the monotonic clock.
     if (timer_create(CLOCK_MONOTONIC, &ev, &t->timer) == -1) {
         perror("timer_create");
         return -1;
     }
 
-    // e) Absolute first beat at t0 + period, then every period: no drift.
+    // e) Absolute first expiry at t0 + period, then every period (no drift).
     t->t0_ns = actor_now_ns();
     int64_t first = t->t0_ns + period_ns;
 
@@ -125,8 +116,8 @@ int actor_timer_start(actor_timer_t *t, int64_t period_ns, int prio)
 
 
 // ---------------------------------------------------------------------------
-// 4. Wait for the next beat, then say how late I woke up.
-//    Returns 0, or -1 with errno set (EINTR = a signal woke me).
+// 4. Block until the next tick; *late_ns = now - due time of tick k.
+//    Returns 0, or -1 with errno (EINTR = interrupted by a signal).
 // ---------------------------------------------------------------------------
 int actor_wait_tick(actor_timer_t *t, int64_t *late_ns)
 {
@@ -144,7 +135,7 @@ int actor_wait_tick(actor_timer_t *t, int64_t *late_ns)
 
 
 // ---------------------------------------------------------------------------
-// 5. Stop the timer and close everything (reverse order of step 3)
+// 5. Release timer, connection and channel (reverse order of step 3)
 // ---------------------------------------------------------------------------
 void actor_timer_stop(actor_timer_t *t)
 {
@@ -155,7 +146,7 @@ void actor_timer_stop(actor_timer_t *t)
 
 
 // ---------------------------------------------------------------------------
-// 6. Lateness scoreboard (lat_add is cheap: no printing, no allocation)
+// 6. Lateness statistics. lat_add runs every cycle: no I/O, no allocation.
 // ---------------------------------------------------------------------------
 void lat_init(lat_stats_t *s, int64_t miss_limit_ns)
 {
@@ -191,7 +182,8 @@ void lat_print(const char *who, lat_stats_t *s)
 
 
 // ---------------------------------------------------------------------------
-// 7. Burn CPU for 'ns' nanoseconds (wall time) = pretend work
+// 7. Simulated work: busy-wait 'ns' of wall time. If preempted, the clock
+//    keeps running, so the actor gets less work done - visible under load.
 // ---------------------------------------------------------------------------
 void actor_spin_ns(int64_t ns, volatile sig_atomic_t *stop)
 {
@@ -206,10 +198,9 @@ void actor_spin_ns(int64_t ns, volatile sig_atomic_t *stop)
 
 // ---------------------------------------------------------------------------
 // 8. Task manager link (comfort actors only)
-//
-//    TimerTimeout arms a one-shot limit for the NEXT blocking kernel call
-//    only. SEND|REPLY = give up if the TM doesn't take or answer the message
-//    within 200 ms; MsgSend then fails with ETIMEDOUT instead of hanging.
+//    tm_arm_limit: TimerTimeout applies to the NEXT blocking call only.
+//    SEND|REPLY = if the TM does not receive and answer within 200 ms,
+//    MsgSend fails with ETIMEDOUT instead of blocking forever.
 // ---------------------------------------------------------------------------
 static int tm_arm_limit(void)
 {
@@ -236,9 +227,9 @@ void tm_link_init(tm_link_t *l, const char *name, int tm_class, int prio,
 int tm_link_register(tm_link_t *l)
 {
     if (l->coid != -1)
-        return 0;                                   // already linked
+        return 0;                                   // already registered
 
-    int coid = name_open(TM_NAME, 0);               // find the TM
+    int coid = name_open(TM_NAME, 0);               // look up "taskmgr"
     if (coid == -1)
         return -1;                                  // TM not running: try later
 
@@ -246,7 +237,7 @@ int tm_link_register(tm_link_t *l)
     memset(&r, 0, sizeof r);
     r.type        = TM_REGISTER;
     r.tm_class    = (uint16_t)l->tm_class;
-    r.tid         = (int32_t)pthread_self();        // on QNX this IS the thread id
+    r.tid         = (int32_t)pthread_self();        // QNX: pthread_t is the tid
     r.base_prio   = l->prio;
     r.budget_pct  = l->budget_pct;
     r.period_us   = l->period_us;
@@ -270,7 +261,7 @@ int tm_link_register(tm_link_t *l)
 
 void tm_link_report(tm_link_t *l, uint32_t misses)
 {
-    if (l->coid == -1) {                            // not linked: try again
+    if (l->coid == -1) {                            // not registered: retry
         tm_link_register(l);
         return;
     }
@@ -284,8 +275,8 @@ void tm_link_report(tm_link_t *l, uint32_t misses)
     if (tm_arm_limit() == -1)
         return;
     if (MsgSend(l->coid, &m, sizeof m, NULL, 0) == -1) {
-        if (errno == EINTR)                         // a signal (e.g. storm switch):
-            return;                                 // harmless, keep the link
+        if (errno == EINTR)                         // interrupted by a signal
+            return;                                 // (e.g. SIGUSR1): keep the link
         printf("%s: lost TM (%s), will re-register\n", l->name, strerror(errno));
         fflush(stdout);
         name_close(l->coid);

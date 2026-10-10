@@ -1,3 +1,22 @@
+// taskmgr.c - Task Manager: CPU-budget enforcement for the comfort pool.
+//
+// Runs alone on core 0 at FIFO 50 as a QNX message-passing server ("taskmgr").
+//   - Comfort actors register (TM_REGISTER) with a class, base priority and
+//     CPU budget. The pid comes from the kernel (_msg_info), so it can't be faked.
+//   - Every 100 ms (timer pulse) it measures each job's CPU share from its
+//     thread CPU clock, and each core's load from the idle threads' clocks.
+//   - Policy: a job over budget for OVER_TICKS ticks is demoted to priority 2
+//     with SchedSet; it is restored to its base priority after it (or the
+//     pool) stays calm. QNX 8.0 has no adaptive partitioning, so budgets are
+//     enforced through priority.
+//   - Safety jobs (class < ASSIST) and unregistered jobs (abs, airbag) are
+//     never touched.
+//   - TM_QUERY_STATE returns a full snapshot (panel, dashboard).
+//   - TM_REQUEST: a timed request that always gets an answer (OK or ETIMEDOUT).
+//
+// Usage:  ./taskmgr [--off] [-q]   --off = measure only, never demote
+//                                  -q    = no console output
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -13,25 +32,26 @@
 #include <sys/syspage.h>
 #include "tm_proto.h"
 
-#define TM_CORE_MASK     0x1u
-#define TM_PRIO          50
-#define TICK_NS          100000000L
-#define DEMOTE_PRIO      2
-#define OVER_TICKS       3
-#define CALM_TICKS       5
-#define MAX_STRIKES      8
-#define FORGIVE_TICKS    50
-#define HOT_TICKS        2
-#define POOL_HOT_PCT     90
-#define POOL_CALM_PCT    70
-#define SAFETY_CORE      1
-#define SAFETY_ALARM_PCT 50
-#define POOL_FIRST       2
+#define TM_CORE_MASK     0x1u  // TM runs alone on core 0
+#define TM_PRIO          50  // above every comfort job, below safety
+#define TICK_NS          100000000L  // monitor period: 100 ms
+#define DEMOTE_PRIO      2  // priority given to a demoted job
+#define OVER_TICKS       3  // ticks over budget before demotion
+#define CALM_TICKS       5  // calm ticks per strike before restore
+#define MAX_STRIKES      8  // cap on repeat-offender penalty
+#define FORGIVE_TICKS    50  // calm ticks (5 s) that clear the strikes
+#define HOT_TICKS        2  // pool-hot ticks before PRESSURE state
+#define POOL_HOT_PCT     90  // pool load counted as hot
+#define POOL_CALM_PCT    70  // pool load counted as calm
+#define SAFETY_CORE      1  // core watched for the safety alarm
+#define SAFETY_ALARM_PCT 50  // safety core load that raises the alarm
+#define POOL_FIRST       2  // comfort pool = cores POOL_FIRST..POOL_LAST
 #define POOL_LAST        2
-#define IDLE_PID         1
-#define MAX_PENDING      8
-#define STATUS_EVERY     10
+#define IDLE_PID         1  // procnto: tid c+1 is the idle thread of core c
+#define MAX_PENDING      8  // TM_REQUESTs in progress at once
+#define STATUS_EVERY     10  // console status every 10 ticks (1 s)
 
+// One registered job.
 typedef struct {
     int       used;
     char      name[TM_NAME_LEN];
@@ -39,47 +59,49 @@ typedef struct {
     int       tid;
     unsigned  tm_class;
     int       base_prio;
-    int       saved_policy;
+    int       saved_policy;  // policy to restore after demotion
     int       cur_prio;
     unsigned  budget_pct;
     unsigned  period_us;
     unsigned  deadline_us;
-    clockid_t clk;
-    uint64_t  cpu_last;
-    uint64_t  wall_last;
-    unsigned  share_pct;
+    clockid_t clk;  // thread CPU-time clock (ClockId)
+    uint64_t  cpu_last;  // CPU ns at the previous tick
+    uint64_t  wall_last;  // wall ns at the previous tick
+    unsigned  share_pct;  // CPU share last tick, % of one core
     int       demoted;
-    unsigned  over;
-    unsigned  under;
-    unsigned  strikes;
+    unsigned  over;  // consecutive ticks over budget
+    unsigned  under;  // consecutive ticks within budget
+    unsigned  strikes;  // times demoted recently: longer calm needed
     unsigned  demote_count;
-    unsigned  misses;
+    unsigned  misses;  // deadline misses reported by the job
 } task_t;
 
+// One TM_REQUEST in progress: the client stays reply-blocked until it ends.
 typedef struct {
     int      used;
     rcvid_t  rcvid;
     uint32_t req_id;
-    int      outcome;
+    int      outcome;  // EOK or ETIMEDOUT, decided at arrival
     uint64_t start;
-    uint64_t fire_at;
+    uint64_t fire_at;  // when the request timer is due
     timer_t  timer;
 } pending_t;
 
+// ---- server state (single-threaded: no locking needed) ----
 static task_t           tasks[TM_MAX_TASKS];
 static pending_t        pend[MAX_PENDING];
 static tm_event_t       ring[TM_EVENT_RING];
 static uint32_t         ev_seq;
-static tm_state_reply_t qr;
+static tm_state_reply_t qr;  // snapshot buffer for TM_QUERY_STATE
 
 static int       ncpu;
-static clockid_t idle_clk[TM_MAX_CPUS];
+static clockid_t idle_clk[TM_MAX_CPUS];  // per-core idle-thread CPU clocks
 static uint64_t  idle_last[TM_MAX_CPUS];
 static uint64_t  mon_wall_last;
 static unsigned  core_load[TM_MAX_CPUS];
 static unsigned  pool_load;
-static unsigned  pool_hot;
-static unsigned  pool_calm;
+static unsigned  pool_hot;  // consecutive hot ticks
+static unsigned  pool_calm;  // consecutive calm ticks
 static int       safety_alarm;
 
 static name_attach_t *attach;
@@ -90,7 +112,7 @@ static int       tick_timer_ok;
 static uint64_t  t0;
 static uint32_t  tick;
 static int       state = TM_STATE_NORMAL;
-static int       enforce = 1;
+static int       enforce = 1;  // 0 with --off: measure only
 static int       quiet = 0;
 static volatile sig_atomic_t stop_flag;
 
@@ -98,6 +120,7 @@ static const char *state_name[] = {"NORMAL", "PRESSURE", "PROTECT", "RECOVER"};
 static const char *ev_name[] = {"?", "register", "gone", "demote", "restore", "state",
                                 "req_done", "req_timeout", "req_reject", "safety_alarm", "repair"};
 
+// Monotonic time in ns, and ms since the TM started.
 static uint64_t now_ns(void)
 {
     struct timespec ts;
@@ -110,6 +133,7 @@ static uint32_t ms_now(void)
     return (uint32_t)((now_ns() - t0) / 1000000ULL);
 }
 
+// Append an event to the ring (read by TM_QUERY_STATE) and print it.
 static void log_event(int kind, const task_t *t, int from, int to, unsigned value)
 {
     tm_event_t *e = &ring[ev_seq % TM_EVENT_RING];
@@ -136,6 +160,8 @@ static void log_event(int kind, const task_t *t, int from, int to, unsigned valu
     }
 }
 
+// Every received message gets exactly one reply or error, so no client
+// is left reply-blocked. ESRCH = client already gone: ignore.
 static void reply_ok(rcvid_t rcvid, const void *buf, size_t len)
 {
     if (MsgReply(rcvid, EOK, buf, len) == -1 && errno != ESRCH)
@@ -148,6 +174,7 @@ static void reply_err(rcvid_t rcvid, int err)
         fprintf(stderr, "taskmgr: MsgError: %s\n", strerror(errno));
 }
 
+// Pin the TM to core 0 and run at FIFO 50.
 static int pin_and_prioritize(void)
 {
     if (ThreadCtl(_NTO_TCTL_RUNMASK, (void *)(uintptr_t)TM_CORE_MASK) == -1) {
@@ -166,6 +193,8 @@ static int pin_and_prioritize(void)
     return 0;
 }
 
+// Core-load monitor: open the CPU clock of each core's idle thread
+// (procnto pid 1, tid c+1) and take a baseline reading.
 static int cpumon_init(void)
 {
     ncpu = _syspage_ptr->num_cpu;
@@ -195,6 +224,8 @@ static int cpumon_init(void)
     return 0;
 }
 
+// Core load = 100 - idle time / elapsed wall time. Pool load = average of
+// cores POOL_FIRST..POOL_LAST.
 static int cpumon_sample(uint64_t now)
 {
     uint64_t idle_now[TM_MAX_CPUS];
@@ -224,11 +255,13 @@ static int cpumon_sample(uint64_t now)
     return 0;
 }
 
+// Only comfort jobs with a budget are subject to the policy.
 static int manageable(const task_t *t)
 {
     return t->used && t->tm_class >= TM_CLASS_ASSIST && t->budget_pct > 0;
 }
 
+// Change another process's thread priority (needs root).
 static int set_prio(pid_t pid, int tid, int policy, int prio)
 {
     struct sched_param sp;
@@ -241,6 +274,7 @@ static int set_prio(pid_t pid, int tid, int policy, int prio)
     return 0;
 }
 
+// Demote: save the current policy, drop to RR priority 2, count a strike.
 static void demote(task_t *t)
 {
     struct sched_param sp;
@@ -260,6 +294,7 @@ static void demote(task_t *t)
     log_event(TM_EV_DEMOTE, t, sp.sched_priority, DEMOTE_PRIO, t->share_pct);
 }
 
+// Restore the saved policy and base priority.
 static void restore(task_t *t)
 {
     if (set_prio(t->pid, t->tid, t->saved_policy, t->base_prio) == -1)
@@ -271,6 +306,11 @@ static void restore(task_t *t)
     log_event(TM_EV_RESTORE, t, DEMOTE_PRIO, t->base_prio, t->share_pct);
 }
 
+// Policy, once per tick:
+//  1. demote every job over budget for OVER_TICKS ticks;
+//  2. restore at most ONE demoted job per tick (highest base priority first),
+//     once it or the pool has been calm for CALM_TICKS * strikes ticks.
+//     One per tick avoids a new storm when everything is restored at once.
 static void apply_policy(void)
 {
     for (int i = 0; i < TM_MAX_TASKS; i++) {
@@ -293,6 +333,8 @@ static void apply_policy(void)
         restore(best);
 }
 
+// System state: PROTECT/RECOVER while a job is demoted, PRESSURE when the
+// pool is hot, otherwise NORMAL. Each change is logged as an event.
 static void update_state(void)
 {
     int nd = 0;
@@ -312,6 +354,7 @@ static void update_state(void)
     }
 }
 
+// One status block per second (parsed by dashboard.py; keep the format).
 static void print_status(void)
 {
     printf("t=%7.1fs %-8s pool %3u%% |", tick / 10.0, state_name[state], pool_load);
@@ -329,6 +372,7 @@ static void print_status(void)
     fflush(stdout);
 }
 
+// 100 ms monitor tick: core loads, safety alarm, each job's CPU share, policy.
 static void on_tick(void)
 {
     uint64_t now = now_ns();
@@ -336,6 +380,7 @@ static void on_tick(void)
     if (cpumon_sample(now) == 0) {
         pool_hot = (pool_load >= POOL_HOT_PCT) ? pool_hot + 1 : 0;
         pool_calm = (pool_load < POOL_CALM_PCT) ? pool_calm + 1 : 0;
+        // Safety-core alarm with 10% hysteresis (observe only, never acts on core 1).
         if (!safety_alarm && core_load[SAFETY_CORE] >= SAFETY_ALARM_PCT) {
             safety_alarm = 1;
             log_event(TM_EV_CORE0_ALARM, NULL, 0, 1, core_load[SAFETY_CORE]);
@@ -349,12 +394,14 @@ static void on_tick(void)
         if (!t->used)
             continue;
         uint64_t cpu;
+        // Clock read fails = thread exited: free its slot.
         if (ClockTime(t->clk, NULL, &cpu) == -1) {
             log_event(TM_EV_GONE, t, t->cur_prio, 0, 0);
             memset(t, 0, sizeof *t);
             continue;
         }
         uint64_t wall = now - t->wall_last;
+        // Share = CPU time used / wall time elapsed, as % of one core.
         unsigned share = wall ? (unsigned)(((cpu - t->cpu_last) * 100) / wall) : 0;
         if (share > 100)
             share = 100;
@@ -362,6 +409,7 @@ static void on_tick(void)
         t->cpu_last = cpu;
         t->wall_last = now;
         struct sched_param sp;
+        // Record the real current priority.
         if (SchedGet(t->pid, t->tid, &sp) != -1)
             t->cur_prio = sp.sched_priority;
         if (manageable(t)) {
@@ -372,6 +420,7 @@ static void on_tick(void)
                 t->under++;
                 t->over = 0;
             }
+            // A long calm period clears the repeat-offender strikes.
             if (!t->demoted && t->strikes > 0 && t->under >= FORGIVE_TICKS)
                 t->strikes = 0;
         }
@@ -383,6 +432,7 @@ static void on_tick(void)
         print_status();
 }
 
+// TM_REGISTER: validate, add the job (pid from the kernel), reply with its slot.
 static void handle_register(rcvid_t rcvid, const tm_msg_t *msg, const struct _msg_info *info)
 {
     const tm_register_t *m = &msg->reg;
@@ -395,6 +445,7 @@ static void handle_register(rcvid_t rcvid, const tm_msg_t *msg, const struct _ms
         reply_err(rcvid, EINVAL);
         return;
     }
+    // Already registered (re-register after a lost reply): return the same slot.
     for (int i = 0; i < TM_MAX_TASKS; i++) {
         if (tasks[i].used && tasks[i].pid == info->pid && tasks[i].tid == m->tid) {
             tm_register_reply_t r;
@@ -420,6 +471,7 @@ static void handle_register(rcvid_t rcvid, const tm_msg_t *msg, const struct _ms
         reply_err(rcvid, ENOSPC);
         return;
     }
+    // CPU clock of the job's thread, plus a baseline reading.
     clockid_t clk = ClockId(info->pid, m->tid);
     if (clk == -1) {
         reply_err(rcvid, errno);
@@ -447,6 +499,8 @@ static void handle_register(rcvid_t rcvid, const tm_msg_t *msg, const struct _ms
     t->clk = clk;
     t->cpu_last = cpu;
     t->wall_last = now_ns();
+    // Job not at its declared base priority (e.g. left demoted by a previous
+    // TM that crashed): repair it.
     if (t->tm_class >= TM_CLASS_ASSIST && sp.sched_priority != t->base_prio) {
         if (set_prio(t->pid, t->tid, pol, t->base_prio) == 0) {
             log_event(TM_EV_REPAIR, t, sp.sched_priority, t->base_prio, 0);
@@ -459,6 +513,7 @@ static void handle_register(rcvid_t rcvid, const tm_msg_t *msg, const struct _ms
     reply_ok(rcvid, &r, sizeof r);
 }
 
+// TM_REPORT_LOAD: store the job's miss count. Only the owner pid may report.
 static void handle_report(rcvid_t rcvid, const tm_msg_t *msg, const struct _msg_info *info)
 {
     const tm_report_load_t *m = &msg->rep;
@@ -479,6 +534,7 @@ static void handle_report(rcvid_t rcvid, const tm_msg_t *msg, const struct _msg_
     reply_ok(rcvid, NULL, 0);
 }
 
+// End a TM_REQUEST: disarm its timer, reply OK or the error, free the slot.
 static void finish_pending(pending_t *p, int outcome)
 {
     struct itimerspec off;
@@ -499,6 +555,9 @@ static void finish_pending(pending_t *p, int outcome)
     p->used = 0;
 }
 
+// TM_REQUEST: reject max_time 0 (EINVAL); otherwise hold the reply and arm a
+// timer for min(work, max_time). Outcome is OK if work fits, else ETIMEDOUT,
+// so the client always gets an answer and never waits forever.
 static void handle_request(rcvid_t rcvid, const tm_msg_t *msg, const struct _msg_info *info)
 {
     const tm_request_t *m = &msg->req;
@@ -555,6 +614,7 @@ static void handle_request(rcvid_t rcvid, const tm_msg_t *msg, const struct _msg
     }
 }
 
+// TM_QUERY_STATE: copy state, core loads, all jobs and the event ring.
 static void handle_query(rcvid_t rcvid, const struct _msg_info *info)
 {
     if (info->msglen < sizeof(tm_query_t)) {
@@ -596,6 +656,8 @@ static void handle_query(rcvid_t rcvid, const struct _msg_info *info)
     reply_ok(rcvid, &qr, sizeof qr);
 }
 
+// Pulses: monitor tick, request timer, client unblock (gave up waiting),
+// client disconnect.
 static void handle_pulse(const struct _pulse *pl)
 {
     switch (pl->code) {
@@ -606,6 +668,7 @@ static void handle_pulse(const struct _pulse *pl)
         int s = pl->value.sival_int;
         if (s < 0 || s >= MAX_PENDING || !pend[s].used)
             break;
+        // Stale pulse from a re-armed timer: ignore.
         if (now_ns() + 1000000ULL < pend[s].fire_at)
             break;
         finish_pending(&pend[s], pend[s].outcome);
@@ -631,6 +694,7 @@ static void handle_pulse(const struct _pulse *pl)
     }
 }
 
+// Dispatch a message on its 16-bit type. Unknown types get ENOSYS.
 static void handle_message(rcvid_t rcvid, const tm_msg_t *msg, const struct _msg_info *info)
 {
     if (info->msglen < sizeof(uint16_t)) {
@@ -659,6 +723,8 @@ static void handle_message(rcvid_t rcvid, const tm_msg_t *msg, const struct _msg
     }
 }
 
+// One periodic 100 ms tick timer + one one-shot timer per request slot.
+// All deliver pulses to our own channel at TM priority.
 static int setup_timers(void)
 {
     struct sigevent ev;
@@ -687,12 +753,15 @@ static int setup_timers(void)
     return 0;
 }
 
+// SIGINT/SIGTERM: leave the receive loop and shut down cleanly.
 static void on_signal(int signo)
 {
     (void)signo;
     stop_flag = 1;
 }
 
+// Clean exit: restore every demoted job (none stays at priority 2), cancel
+// pending requests, release timers and the registered name.
 static void shutdown_tm(void)
 {
     for (int i = 0; i < TM_MAX_TASKS; i++)
@@ -738,6 +807,7 @@ int main(int argc, char *argv[])
     if (cpumon_init() == -1)
         return EXIT_FAILURE;
 
+    // Register "taskmgr" so clients can name_open() it.
     attach = name_attach(NULL, TM_NAME, 0);
     if (attach == NULL) {
         fprintf(stderr, "taskmgr: name_attach: %s (already running? slay taskmgr)\n", strerror(errno));
@@ -745,6 +815,7 @@ int main(int argc, char *argv[])
     }
     chid = attach->chid;
 
+    // Connection to our own channel, used by the timers to send pulses.
     self_coid = ConnectAttach(0, 0, chid, _NTO_SIDE_CHANNEL, 0);
     if (self_coid == -1) {
         fprintf(stderr, "taskmgr: ConnectAttach: %s\n", strerror(errno));
@@ -759,6 +830,7 @@ int main(int argc, char *argv[])
     printf("taskmgr: ready (%s)\n", enforce ? "enforcing" : "watch only --off");
     fflush(stdout);
 
+    // Server loop: rcvid 0 = pulse, otherwise a message that needs a reply.
     tm_msg_t msg;
     struct _msg_info info;
     while (!stop_flag) {

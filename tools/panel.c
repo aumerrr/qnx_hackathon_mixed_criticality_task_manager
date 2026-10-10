@@ -1,3 +1,18 @@
+// panel.c - LED status panel and judge's stress control (core 3, RR 10).
+//
+// Every 100 ms it asks the task manager for its state (TM_QUERY_STATE, 50 ms
+// limit) and shows it on three LEDs:
+//   GREEN  = every registered job within budget
+//   RED    = a job is over budget and not yet demoted (held at least 1 s)
+//   YELLOW = a job has been demoted by the task manager
+//   all off = task manager not reachable
+// Stress control: SIGUSR1 toggles stress in the selected comfort actor.
+// Only decoder and ui can be selected; abs and airbag can never be stressed.
+//
+// Usage:  ./panel <decoder pid> [ui pid] [key]      (pid 0 = not running)
+//   key mode: 1 = select decoder, 2 = select ui, s = stress on/off, q = quit
+//   otherwise a push button on GPIO 5 toggles stress of the selected actor
+
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -13,31 +28,33 @@
 
 #include "actors.h"
 
-#define PANEL_PRIO   10
-#define PANEL_TICK   (20 * NS_PER_MS)
-#define LED_EVERY    5
-#define RED_HOLD     (1000 * NS_PER_MS)
-#define QUERY_LIMIT  (50 * NS_PER_MS)
-#define BTN_STABLE   5
-#define BTN_LOCKOUT  (1000 * NS_PER_MS)
+#define PANEL_PRIO   10  // low priority, monitoring core
+#define PANEL_TICK   (20 * NS_PER_MS)  // input polling period
+#define LED_EVERY    5  // query TM / update LEDs every 5 ticks = 100 ms
+#define RED_HOLD     (1000 * NS_PER_MS)  // keep RED visible at least 1 s
+#define QUERY_LIMIT  (50 * NS_PER_MS)  // max wait for the TM reply
+#define BTN_STABLE   5  // debounce: 5 equal reads (100 ms)
+#define BTN_LOCKOUT  (1000 * NS_PER_MS)  // ignore presses within 1 s
 
+// BCM GPIO numbers, driven through the rpi_gpio resource manager (/dev/gpio).
 #define PIN_GREEN    17
 #define PIN_YELLOW   27
 #define PIN_RED      22
 #define PIN_BUTTON   5
 
+// LED states.
 enum { L_OFF, L_GREEN, L_YELLOW, L_RED };
 
 static const char *lname[] = {"OFF (TM offline)", "GREEN (all under budget)",
                               "YELLOW (demoted)", "RED (greedy)"};
 static const int   led_pin[3] = {PIN_GREEN, PIN_YELLOW, PIN_RED};
-static int         led_now[3] = {-1, -1, -1};
+static int         led_now[3] = {-1, -1, -1};  // last written state, -1 = unknown
 static int         led_warned;
-static tm_state_reply_t st;
-static struct termios saved_tio;
+static tm_state_reply_t st;  // TM_QUERY_STATE reply buffer
+static struct termios saved_tio;  // terminal settings restored at exit
 static int         tio_saved;
 
-volatile sig_atomic_t stop = 0;
+volatile sig_atomic_t stop = 0;  // set by SIGINT/SIGTERM or 'q'
 
 static void on_stop(int sig)
 {
@@ -45,6 +62,7 @@ static void on_stop(int sig)
     stop = 1;
 }
 
+// Write a command ("out", "in", "on", "off") to /dev/gpio/<pin>.
 static int gpio_write(int pin, const char *cmd)
 {
     char path[32];
@@ -60,6 +78,7 @@ static int gpio_write(int pin, const char *cmd)
     return (w == (ssize_t)n) ? 0 : -1;
 }
 
+// Read the raw text value of /dev/gpio/<pin>.
 static int gpio_read_raw(int pin, char *buf, size_t len)
 {
     char path[32];
@@ -77,6 +96,7 @@ static int gpio_read_raw(int pin, char *buf, size_t len)
     return 0;
 }
 
+// Raw GPIO text -> 1 / 0, or -1 if unrecognised.
 static int parse_level(const char *s)
 {
     while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')
@@ -88,6 +108,8 @@ static int parse_level(const char *s)
     return -1;
 }
 
+// Key mode: put the terminal in non-canonical, no-echo, non-blocking mode
+// so single key presses can be polled every tick.
 static int key_init(void)
 {
     if (!isatty(STDIN_FILENO)) {
@@ -110,6 +132,7 @@ static int key_init(void)
     return 0;
 }
 
+// Restore the original terminal settings.
 static void key_restore(void)
 {
     if (tio_saved)
@@ -117,6 +140,7 @@ static void key_restore(void)
     tio_saved = 0;
 }
 
+// One pending key, or -1 if none.
 static int key_read(void)
 {
     char c;
@@ -124,6 +148,8 @@ static int key_read(void)
     return (n == 1) ? (unsigned char)c : -1;
 }
 
+// Set one LED, writing to GPIO only when its state changes. A write error
+// is reported once.
 static void led_set(int i, int on)
 {
     if (led_now[i] == on)
@@ -137,6 +163,7 @@ static void led_set(int i, int on)
     }
 }
 
+// Exactly one LED on for each state, all off for L_OFF.
 static void show(int s)
 {
     led_set(0, s == L_GREEN);
@@ -144,6 +171,8 @@ static void show(int s)
     led_set(2, s == L_RED);
 }
 
+// TM_QUERY_STATE with a 50 ms kernel time limit (TimerTimeout), so a stuck
+// task manager can never freeze the panel.
 static int query_tm(int coid)
 {
     tm_query_t q;
@@ -160,6 +189,8 @@ static int query_tm(int coid)
     return 0;
 }
 
+// LED state from the snapshot: RED if any comfort job is over budget and not
+// demoted, otherwise YELLOW if any job is demoted, otherwise GREEN.
 static int classify(void)
 {
     int greedy = 0;
@@ -179,17 +210,18 @@ static int classify(void)
     return L_GREEN;
 }
 
-/* Stress targets. Only these two comfort actors can be stressed from the
- * panel: abs and airbag are never given to the panel, so it cannot signal them. */
+/* Stress targets: only decoder and ui. abs and airbag pids are never passed
+ * to the panel, so it cannot signal them. */
 typedef struct {
     const char *name;
     pid_t       pid;     /* 0 = not available */
-    int         storm;   /* our view: flipped by every SIGUSR1 we send */
+    int         storm;   /* our view of its stress state (flipped per SIGUSR1) */
 } target_t;
 
 static target_t targets[2] = { {"decoder", 0, 0}, {"ui", 0, 0} };
 static int      selected = 0;
 
+// Print the selected target and its stress state.
 static void show_selection(void)
 {
     target_t *t = &targets[selected];
@@ -198,6 +230,7 @@ static void show_selection(void)
     fflush(stdout);
 }
 
+// Select target i (0 = decoder, 1 = ui) if it is running.
 static void select_target(int i)
 {
     if (targets[i].pid <= 0)
@@ -207,6 +240,8 @@ static void select_target(int i)
     show_selection();
 }
 
+// Send SIGUSR1 to the selected target only. A vanished target (ESRCH) is
+// marked unavailable.
 static void toggle_storm(const char *how)
 {
     target_t *t = &targets[selected];
@@ -225,6 +260,7 @@ static void toggle_storm(const char *how)
 
 int main(int argc, char *argv[])
 {
+    // Arguments: up to two pids (decoder, ui) and the optional word "key".
     int use_key = 0;
     int npid = 0;
     int bad = 0;
@@ -243,7 +279,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     int valid = 0;
-    for (int i = 1; i >= 0; i--) {          /* ends with the first valid one selected */
+    for (int i = 1; i >= 0; i--) {          /* check pids; select the first valid one */
         if (targets[i].pid > 0 && kill(targets[i].pid, 0) == -1) {
             printf("panel: %s pid %d not running (%s), ignored\n",
                    targets[i].name, (int)targets[i].pid, strerror(errno));
@@ -259,14 +295,17 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    // Clean stop on SIGINT/SIGTERM.
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_stop;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    // Monitoring core 3, RR 10.
     if (actor_setup(RMASK_VIEW, SCHED_RR, PANEL_PRIO) == -1) return 1;
 
+    // LED pins as outputs.
     for (int i = 0; i < 3; i++) {
         if (gpio_write(led_pin[i], "out\n") == -1) {
             printf("panel: GPIO %d (LED) setup failed: %s\n", led_pin[i], strerror(errno));
@@ -274,6 +313,7 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Button mode: configure the input and read its idle level.
     char raw[16];
     int level = 0;
     if (!use_key) {
@@ -294,11 +334,13 @@ int main(int argc, char *argv[])
         }
     }
 
+    // LED self-test: green, yellow, red, off.
     show(L_GREEN);  usleep(300000);
     show(L_YELLOW); usleep(300000);
     show(L_RED);    usleep(300000);
     show(L_OFF);
 
+    // 20 ms polling tick.
     actor_timer_t timer;
     if (actor_timer_start(&timer, PANEL_TICK, PANEL_PRIO) == -1) {
         show(L_OFF);
@@ -315,6 +357,7 @@ int main(int argc, char *argv[])
            use_key ? "KEY MODE" : "button toggles stress of the selected actor");
     show_selection();
 
+    // Loop state: TM connection, last LED shown, RED hold, button debounce.
     int coid = -1;
     int last = -1;
     int64_t red_until = 0;
@@ -332,6 +375,7 @@ int main(int argc, char *argv[])
             break;
         }
 
+        // Input: drain all pending keys, or debounce the button.
         if (use_key) {
             int c;
             while ((c = key_read()) != -1) {
@@ -368,9 +412,11 @@ int main(int argc, char *argv[])
             btn_warned = 1;
         }
 
+        // Every 100 ms: query the TM and update the LEDs.
         if (timer.tick % LED_EVERY != 0)
             continue;
 
+        // (Re)connect if needed; a failed query drops the connection = LEDs off.
         if (coid == -1)
             coid = name_open(TM_NAME, 0);
 
@@ -384,6 +430,7 @@ int main(int argc, char *argv[])
             }
         }
 
+        // Hold RED for RED_HOLD so a short overload stays visible.
         int64_t now = actor_now_ns();
         if (s == L_RED)
             red_until = now + RED_HOLD;
@@ -392,6 +439,7 @@ int main(int argc, char *argv[])
 
         show(s);
 
+        // Log only LED changes.
         if (s != last) {
             printf("panel: LED %s\n", lname[s]);
             fflush(stdout);

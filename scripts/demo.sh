@@ -1,5 +1,5 @@
 #!/bin/sh
-# demo.sh - start / stop / watch the whole demo on the Pi.
+# demo.sh - Pi side: start / stop / monitor the whole demo (run as root).
 #
 #   /tmp/demo.sh start          taskmgr (enforcing) + abs + airbag + decoder + nav + ui
 #   /tmp/demo.sh start --off    same, taskmgr watch-only (no demotion)
@@ -12,10 +12,11 @@
 #
 # Everything except "install" must run as root (su).
 #
-# Task manager guardian: taskmgr runs inside a loop that restarts it 1 s after
-# it exits for any reason (crash, kill test, SIGHUP). Every start/exit is
-# written to /tmp/run1/guard.log with a timestamp -> that is your recovery time.
-# All programs ignore SIGHUP, so closing the ssh window no longer kills them.
+# Guardian: taskmgr runs inside a loop that restarts it 1 s after any exit
+# (crash, kill test). Every start/exit is timestamped in /tmp/run1/guard.log,
+# which gives the recovery time. All programs ignore SIGHUP, so closing the
+# ssh window does not kill them. "stop" sets a flag first, so the guardian
+# does not restart taskmgr during shutdown.
 
 BIN=/tmp
 RUN=/tmp/run1

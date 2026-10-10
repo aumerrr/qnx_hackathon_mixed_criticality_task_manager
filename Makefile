@@ -1,11 +1,10 @@
-# qnx_hackathon - QNX 8.0, Raspberry Pi 4 (aarch64)
+# qnx_hackathon - build for QNX 8.0 on Raspberry Pi 4 (aarch64, qcc)
 #
-#   car/      abs.c airbag.c decoder.c nav.c ui.c
-#   common/   actors.c actors.h taskmgr.c tm_proto.h
-#   tools/    panel.c dashboard.py
+#   car/      actors: abs.c airbag.c decoder.c nav.c ui.c
+#   common/   shared: actors.c actors.h (actor library), taskmgr.c, tm_proto.h
+#   tools/    panel.c (LED panel), dashboard.py (not compiled)
 #
-#   build/obj/   object files (.o)
-#   build/       finished programs
+#   build/obj/   object files      build/   finished programs
 #
 #   make          build all programs
 #   make deploy   copy the programs + dashboard.py to the Pi (/tmp)
@@ -21,12 +20,13 @@ BIN     = build
 OBJ     = build/obj
 BINS    = $(BIN)/taskmgr $(BIN)/abs $(BIN)/airbag $(BIN)/decoder $(BIN)/nav $(BIN)/ui $(BIN)/panel
 
-# headers every actor depends on (a change rebuilds them all)
+# Headers every actor includes: changing one rebuilds every actor, so all
+# programs always agree on the tm_proto.h message layout.
 ACT_H   = common/actors.h common/tm_proto.h
 
 all: $(BINS)
 
-# ---- link: objects -> programs (actors.o is shared, compiled once) ----
+# ---- link: objects -> programs (actors.o is compiled once, linked into each actor) ----
 $(BIN)/taskmgr: $(OBJ)/taskmgr.o
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/taskmgr.o
 
@@ -48,7 +48,7 @@ $(BIN)/ui: $(OBJ)/ui.o $(OBJ)/actors.o
 $(BIN)/panel: $(OBJ)/panel.o $(OBJ)/actors.o
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/panel.o $(OBJ)/actors.o
 
-# ---- compile: sources -> objects ----
+# ---- compile: sources -> objects (-Icommon finds the shared headers) ----
 $(OBJ)/taskmgr.o: common/taskmgr.c common/tm_proto.h | $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ common/taskmgr.c
 
@@ -73,7 +73,7 @@ $(OBJ)/ui.o: car/ui.c $(ACT_H) | $(OBJ)
 $(OBJ)/panel.o: tools/panel.c $(ACT_H) | $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ tools/panel.c
 
-# object folder, created once (also safe with make -j)
+# Object folder; order-only prerequisite (|), so it is created once and is safe with make -j.
 $(OBJ):
 	mkdir -p $(OBJ)
 

@@ -1,100 +1,99 @@
-// actors.h - helpers shared by all actors (abs, decoder, nav, ...)
+// actors.h - library shared by every actor (abs, airbag, decoder, nav, ui, panel)
 //
-// Every actor includes this file. The code for these functions is in
-// actors.c, and the Makefile links actors.c into every sim.
+// Provides: core pinning + priority, periodic timer pulses, lateness
+// statistics, simulated CPU work, and the client side of the task manager
+// protocol. Implemented in actors.c, linked into every actor by the Makefile.
 
-#ifndef ACTORS_H       // "include guard": stops this file being read twice
+#ifndef ACTORS_H
 #define ACTORS_H
 
-#include <signal.h>    // sig_atomic_t (the type of the "stop" flags)
-#include <stdint.h>    // int64_t, uint64_t (integers with a fixed size)
+#include <signal.h>    // sig_atomic_t
+#include <stdint.h>    // int64_t, uint64_t
 #include <time.h>      // timer_t
-#include "tm_proto.h"  // task manager messages (used by tm_link_*)
+#include "tm_proto.h"  // task manager message formats (used by tm_link_*)
 
 // ---------------------------------------------------------------------------
-// Core plan. A runmask is a bit pattern: bit 0 = core 0, bit 1 = core 1 ...
+// Core plan (runmask bit N = core N). The only place core numbers are defined.
 //
-//   core 0      0x1 = 0001  task manager (alone)
-//   core 1      0x2 = 0010  safety: abs (later airbag, steering)
-//   core 2      0x4 = 0100  comfort pool: decoder (15), nav (12)
-//   core 3      0x8 = 1000  viewers: logger, dashboard
+//   core 0  0x1  task manager (alone)
+//   core 1  0x2  safety pool:  abs (FIFO 63), airbag (FIFO 62)
+//   core 2  0x4  comfort pool: decoder (RR 15), nav (RR 12), ui (RR 10)
+//   core 3  0x8  monitoring:   panel, dashboard
 //
-// QNX 8.0 on this image only accepts single-core runmasks (0xC gave
-// "Invalid argument"), so every thread is pinned to exactly one core.
-// If the plan changes, change it HERE only. Sims never type raw numbers.
+// Each thread is pinned to exactly one core: on this QNX 8.0 image a
+// multi-core runmask (0xC) was rejected with EINVAL.
 // ---------------------------------------------------------------------------
 #define RMASK_TM     0x1u
 #define RMASK_SAFETY 0x2u
 #define RMASK_POOL   0x4u
 #define RMASK_VIEW   0x8u
 
-// Time units. Everything in this project is in nanoseconds (ns).
-// "LL" makes them 64-bit numbers, so big multiplications can't overflow.
+// All times in the project are int64 nanoseconds (LL = 64-bit, no overflow).
 #define NS_PER_US 1000LL         // 1 microsecond
 #define NS_PER_MS 1000000LL      // 1 millisecond
 #define NS_PER_S  1000000000LL   // 1 second
 
 // ---------------------------------------------------------------------------
-// The "drummer": a kernel timer that drops a pulse (tiny note) into my
-// private mailbox every period_ns. I sleep at the mailbox until it arrives.
+// Periodic timer: a kernel timer delivers a pulse to a private channel every
+// period_ns; the actor blocks in MsgReceivePulse until it arrives.
 // ---------------------------------------------------------------------------
 typedef struct {
-    int      chid;       // my mailbox (channel id)
-    int      coid;       // my line into my own mailbox (the timer uses it)
-    timer_t  timer;      // the kernel timer itself
-    int64_t  t0_ns;      // time when I started; beat k is due at t0 + k*period
-    int64_t  period_ns;  // time between two beats
-    uint64_t tick;       // how many beats I have received so far (= k)
+    int      chid;       // private channel that receives the pulses
+    int      coid;       // connection to that channel, used by the timer
+    timer_t  timer;      // kernel timer
+    int64_t  t0_ns;      // start time; tick k is due at t0 + k * period
+    int64_t  period_ns;  // period
+    uint64_t tick;       // ticks received so far (= k)
 } actor_timer_t;
 
 // ---------------------------------------------------------------------------
-// Lateness scoreboard. Only numbers, so updating it is very cheap.
+// Lateness statistics (wake-up time minus due time), updated every cycle.
 // ---------------------------------------------------------------------------
 typedef struct {
-    int64_t  min_ns;         // smallest lateness seen
-    int64_t  max_ns;         // biggest lateness seen
-    int64_t  sum_ns;         // total of all lateness (for the average)
-    uint64_t count;          // how many cycles measured
-    uint64_t misses;         // how many cycles were later than the limit
-    int64_t  miss_limit_ns;  // what counts as "too late"
+    int64_t  min_ns;         // minimum lateness
+    int64_t  max_ns;         // maximum lateness
+    int64_t  sum_ns;         // sum, for the average
+    uint64_t count;          // cycles measured
+    uint64_t misses;         // cycles later than miss_limit_ns
+    int64_t  miss_limit_ns;  // deadline-miss threshold
 } lat_stats_t;
 
 // ---------------------------------------------------------------------------
-// Link to the task manager (COMFORT actors only, NEVER abs).
-// Every call has a 200 ms limit, so a dead or stuck TM can't freeze us.
+// Client link to the task manager. Comfort actors only: safety actors
+// (abs, airbag) never message the TM. Every call is limited to 200 ms, so a
+// dead or stuck TM can delay an actor but never block it.
 // ---------------------------------------------------------------------------
 typedef struct {
-    int      coid;                 // connection to the TM, -1 = not linked
-    int      handle;               // ticket the TM gave us at registration
-    char     name[TM_NAME_LEN];    // name shown in the TM
-    int      tm_class;             // TM_CLASS_INFOTAINMENT etc.
-    int      prio;                 // my normal priority (TM restores to this)
-    unsigned budget_pct;           // % of one core I'm allowed
-    unsigned period_us;            // my frame period
+    int      coid;                 // connection to the TM, -1 = not registered
+    int      handle;               // slot index returned by TM_REGISTER
+    char     name[TM_NAME_LEN];    // name shown by the TM
+    int      tm_class;             // TM_CLASS_*; >= ASSIST may be demoted
+    int      prio;                 // base priority the TM restores to
+    unsigned budget_pct;           // CPU budget, % of one core
+    unsigned period_us;            // frame period
 } tm_link_t;
 
-// 1. put this thread on 'runmask' cores, with this policy and priority
+// Pin the calling thread to 'runmask' and set its policy and priority.
 int     actor_setup(unsigned runmask, int policy, int prio);
 
-// 2. current time in ns
+// CLOCK_MONOTONIC time in ns.
 int64_t actor_now_ns(void);
 
-// 3-5. the drummer: start it, wait for a beat, stop it
+// Periodic timer: start, block until the next tick (returns lateness), stop.
 int  actor_timer_start(actor_timer_t *t, int64_t period_ns, int prio);
 int  actor_wait_tick(actor_timer_t *t, int64_t *late_ns);
 void actor_timer_stop(actor_timer_t *t);
 
-// 6. the scoreboard
+// Lateness statistics: reset, add one sample, print the summary line.
 void lat_init(lat_stats_t *s, int64_t miss_limit_ns);
 void lat_add(lat_stats_t *s, int64_t late_ns);
 void lat_print(const char *who, lat_stats_t *s);
 
-// 7. burn CPU for 'ns' nanoseconds (pretend work for comfort actors).
-//    Stops early if *stop becomes 1 (pass NULL if you don't need that).
+// Busy-wait 'ns' of wall time (simulated work); returns early if *stop is set.
 void actor_spin_ns(int64_t ns, volatile sig_atomic_t *stop);
 
-// 8. task manager link: init once, register, report every ~1 s, close at end.
-//    tm_link_report re-registers by itself if the TM was restarted.
+// TM link: init once, register, report misses every ~1 s, close at exit.
+// tm_link_report re-registers automatically after a TM restart.
 void tm_link_init(tm_link_t *l, const char *name, int tm_class, int prio,
                   unsigned budget_pct, unsigned period_us);
 int  tm_link_register(tm_link_t *l);
